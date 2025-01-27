@@ -1,0 +1,332 @@
+---
+title: "ADNI-Analysis5-2"
+output: html_document
+date: "2024-10-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+```
+
+```{r cars}
+# load data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+normalize_minmax <- function(x) {
+  return ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+}
+
+sort_viscode <- function(viscode, months, cdrsb) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices]
+  )
+}
+
+data <- data %>% filter(!is.na(WholeBrain)) %>%
+  mutate(across(where(is.numeric), normalize_minmax))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+```
+
+```{r}
+# Get the dtw data
+time_series_data <- grouped_data$cdrsb_scores
+
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+cluster_assignments <- dtw_kmeans_result@cluster
+dtw_data <- grouped_data
+dtw_data$cluster <- as.factor(cluster_assignments)
+dtw_data <- dtw_data %>%
+  mutate(cdrsb_mean = map_dbl(cdrsb_scores, ~ mean(unlist(.))))
+
+dtw_data <- dtw_data %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+```
+
+```{r}
+perform_clustering <- function(summary_data, centers = 4, seed = 123) {
+  # Clean the data
+  cleaned_summary_table <- summary_data %>%
+    drop_na()
+  
+  # Set seed for reproducibility
+  set.seed(seed)
+  
+  # Perform k-means clustering
+  kmeans_result <- kmeans(cleaned_summary_table %>% dplyr::select(-PTID), centers = centers)
+  
+  # Add cluster results to the summary table
+  cleaned_summary_table <- cleaned_summary_table %>%
+    mutate(cluster = kmeans_result$cluster)
+  
+  grouped_data_with_clusters <- grouped_data %>%
+    left_join(cleaned_summary_table %>% dplyr::select(PTID, cluster), by = "PTID")
+  
+  return(list(kmeans_result = kmeans_result, grouped_data_with_clusters = grouped_data_with_clusters))
+}
+```
+
+```{r}
+# Clustering with only first and last cdrsb
+summary_table_1 <- grouped_data %>%
+  mutate(    
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)])        
+  ) %>%
+  select(PTID, cdrsb_first, cdrsb_last)
+
+result_1 <- perform_clustering(summary_table_1)
+grouped_data_with_clusters <- result_1$grouped_data_with_clusters
+
+long_data_1 <- left_join(grouped_data_with_clusters, filtered_data, by = "PTID")
+
+long_data_1 <- long_data_1 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression",
+                                     "Moderate Progression")))
+
+```
+
+```{r}
+# Clustering with only mean and sd
+summary_table_2 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE)              
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_sd)
+
+result_2 <- perform_clustering(summary_table_2)
+grouped_data_with_clusters <- result_2$grouped_data_with_clusters
+
+long_data_2 <- left_join(grouped_data_with_clusters, filtered_data, by = "PTID")
+
+long_data_2 <- long_data_2 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Severe Progression", 
+                                     "Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Stable")))
+```
+
+```{r}
+# Cluster with first, last, mean, and sd of cdrsb
+summary_table_3 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE)              
+  ) %>%
+  dplyr::select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd)
+
+result_3 <- perform_clustering(summary_data = summary_table_3)
+grouped_data_with_clusters <- result_3$grouped_data_with_clusters
+
+long_data_3 <- left_join(grouped_data_with_clusters, filtered_data, by = "PTID")
+
+long_data_3 <- long_data_3 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Severe Progression", 
+                                     "Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Stable")))
+```
+
+```{r}
+# Clustering with time diff
+summary_table_4 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    visits_count = map_int(cdrsb_scores, length),
+    months_diff = map_dbl(months, ~ .x[length(.x)] - .x[1])
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd, visits_count, months_diff)
+
+result_4 <- perform_clustering(summary_table_4)
+grouped_data_with_clusters <- result_4$grouped_data_with_clusters
+
+long_data_4 <- left_join(grouped_data_with_clusters, filtered_data, by = "PTID")
+
+long_data_4 <- long_data_4 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable",
+                                     "Mild Progression")))
+
+```
+
+## Significant level between DTW and other methods
+For this part we will use null hypothesis as "The distribution of patients across clusters is the same for both the DTW-based clustering and the k-means clustering".
+```{r}
+merged_data <- left_join(dtw_data, data, by = "PTID")
+
+# significant level of dtw cluster and first method
+contingency_table <- table(merged_data$cluster, long_data_1$cluster)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+Based on the comparison result between DTW cluster and k means that only use first and last CDRSB value we can see the p-value is very low so we can reject the null hypothesis here. Furthermore we can see large Chi-square value confirms that the two clustering methods produce significantly different distributions of patients across clusters.
+
+```{r}
+# significant level of dtw cluster and second method
+contingency_table <- table(merged_data$cluster, long_data_2$cluster)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+Next is the comparison result between DTW cluster and k means that only use mean and sd CDRSB value we can see the p-value is very low so we can reject the null hypothesis here. Furthermore we can also see large Chi-square value, in fact larger than the first method, confirms that the two clustering methods produce significantly different distributions of patients across clusters.
+
+```{r}
+# significant level of dtw cluster and second method
+contingency_table <- table(merged_data$cluster, long_data_3$cluster)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+Next is the comparison result between DTW cluster and k means that use first, last, mean and sd CDRSB value we can see the p-value is very low so we can reject the null hypothesis here. We can also see large Chi-square value, in fact larger than the first method, confirms that the two clustering methods produce significantly different distributions of patients across clusters.
+
+```{r}
+# significant level of dtw cluster and second method
+contingency_table <- table(merged_data$cluster, long_data_4$cluster)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+Next is the comparison result between DTW cluster and k means that use first, last, mean and sd CDRSB, also including time aspect, we can see the p-value is very low so we can reject the null hypothesis here. But here we can see that the chi square value actually smaller, far smaller than the other methods, indicates less discrepancy between the clustering methods compared to the previous result. So there are more similarity when we include the time aspect.
+
+The degree of freedom in all clusters shown as 9 means the observed differences are still significant and unlikely due to random variation.
+
+## Significant level between cluster and other variables
+The null hypothesis for this section is no association between cluster and the chosen variable.
+```{r}
+# signiifcant of dtw cluster and APOE4
+contingency_table <- table(merged_data$cluster, merged_data$APOE4)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+Because the low p-value we can reject the null hypothesis, then we can see the high chisquare value suggests a significant level of discrepancy, indicating that the distribution of APOE4 status across clusters is not uniform. This result implies that the APOE4 status of patients is significantly associated with the clustering results. In other words, the clustering method has likely grouped individuals in a way that corresponds meaningfully with their APOE4 status. This could suggest that APOE4 is a relevant factor in the progression patterns identified by the clustering algorithm, providing insight into how genetic factors may influence the course of Alzheimer's disease in different clusters.
+
+```{r}
+# signiifcant of dtw cluster and gender
+contingency_table <- table(merged_data$cluster, merged_data$PTGENDER)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+The test result provides strong evidence to reject the null hypothesis, meaning that gender distribution is not uniform across the clusters. There is a significant association between cluster assignment and gender, implying that certain clusters may have a higher proportion of one gender compared to others.
+
+```{r}
+# signiifcant of dtw cluster and education
+contingency_table <- table(merged_data$cluster, merged_data$PTEDUCAT)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+As the education use number of years, we can group it first
+
+```{r}
+merged_data <- merged_data %>%
+  mutate(PTEDUCAT = case_when(
+    PTEDUCAT < 0.33 ~ "Low",
+    PTEDUCAT >= 0.33 & PTEDUCAT < 0.66 ~ "Medium",
+    PTEDUCAT >= 0.66 ~ "High"
+  ))
+
+# signiifcant of dtw cluster and education
+contingency_table <- table(merged_data$cluster, merged_data$PTEDUCAT)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+After we group the education become low, medium, and high, we can see result with less complexity contigency table. The p-value still low which we can see relation between clustering result and education, this implies that the education levels may be distributed differently across the clusters, indicating that education could have some relationship with the identified progression clusters.
+
+```{r}
+# signiifcant of dtw cluster and age
+contingency_table <- table(merged_data$cluster, merged_data$AGE)
+# Perform the Chi-square test
+chi_square_test <- chisq.test(contingency_table)
+
+# Output the result
+print(chi_square_test)
+```
+
+The result of age p-value is really low, but we can see that it is too complex to group.

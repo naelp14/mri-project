@@ -1,0 +1,217 @@
+---
+title: "ADNI-Analysis8-3"
+output: html_document
+date: "2024-12-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+library("xgboost")
+library("caTools")
+library("caret")
+library("pROC")
+```
+
+## R Markdown
+
+```{r}
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-dtw.csv")
+```
+
+```{r}
+train_xgb_model <- function(data) {
+  # Ensure correct levels for `cluster`
+  data$cluster <- factor(data$cluster, levels = c("Stable", "Mild Progression", "Moderate Progression", "Severe Progression"))
+  
+  # Split data
+  set.seed(123)
+  sample_split <- sample.split(Y = data$cluster, SplitRatio = 0.7)
+  train_set <- subset(data, sample_split == TRUE)
+  test_set <- subset(data, sample_split == FALSE)
+  
+  # Prepare labels and features
+  y_train <- as.integer(train_set$cluster) - 1
+  y_test <- as.integer(test_set$cluster) - 1
+  X_train <- train_set %>% dplyr::select(-cluster) %>% as.data.frame() %>% mutate_all(as.numeric)
+  X_test <- test_set %>% dplyr::select(-cluster) %>% as.data.frame() %>% mutate_all(as.numeric)
+  
+  # Convert to xgb.DMatrix
+  xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+  
+  # Set parameters
+  num_classes <- length(unique(y_train))  # Ensure correct num_class
+  xgb_params <- list(
+    booster = "gbtree",
+    eta = 0.01,
+    max_depth = 8,
+    gamma = 4,
+    subsample = 0.75,
+    colsample_bytree = 1,
+    objective = "multi:softprob",
+    eval_metric = "mlogloss",
+    num_class = num_classes
+  )
+  
+  # Train the model
+  xgb_model <- xgb.train(
+    params = xgb_params,
+    data = xgb_train,
+    nrounds = 5000,
+    verbose = 1
+  )
+  
+  # Predict and calculate AUC
+  pred_probs <- predict(xgb_model, newdata = xgb_test)
+  pred_probs <- matrix(pred_probs, ncol = num_classes, byrow = TRUE)
+  auc_values <- sapply(0:(num_classes - 1), function(class) {
+    binary_labels <- ifelse(y_test == class, 1, 0)
+    roc_obj <- roc(binary_labels, pred_probs[, class + 1])
+    auc(roc_obj)
+  })
+  
+  names(auc_values) <- paste("AUC_Class", 0:(num_classes - 1), sep = "_")
+  
+  # Return the model and AUC
+  return(list(model = xgb_model, auc = auc_values))
+}
+
+```
+
+Below we can see CG Latent significance
+
+```{r}
+# xgb with cg latent and cluster
+cg_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/cg_latent.csv")
+cg_data$cluster <- factor(cg_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+cg_xgb <- train_xgb_model(cg_data)
+cg_importance_matrix <- xgb.importance(model = cg_xgb$model)
+print(cg_importance_matrix)
+xgb.plot.importance(cg_importance_matrix)
+```
+
+Below we can see CSF Latent significance
+
+```{r}
+# xgb with csf latent and cluster
+csf_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/csf_latent.csv")
+csf_data$cluster <- factor(csf_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+csf_xgb <- train_xgb_model(csf_data)
+csf_importance_matrix <- xgb.importance(model = csf_xgb$model)
+print(csf_importance_matrix)
+xgb.plot.importance(csf_importance_matrix)
+```
+
+Below we can see PET Latent significance
+
+```{r}
+# xgb with pet latent and cluster
+pet_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/pet_latent.csv")
+pet_data$cluster <- factor(pet_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+pet_xgb <- train_xgb_model(pet_data)
+pet_importance_matrix <- xgb.importance(model = pet_xgb$model)
+print(pet_importance_matrix)
+print(pet_xgb$auc)
+xgb.plot.importance(pet_importance_matrix)
+```
+
+Below we can see Risk Latent significance
+
+```{r}
+# xgb with risk latent and cluster
+risk_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/risk_latent.csv")
+risk_data$cluster <- factor(risk_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+risk_xgb <- train_xgb_model(risk_data)
+risk_importance_matrix <- xgb.importance(model = risk_xgb$model)
+print(risk_importance_matrix)
+xgb.plot.importance(risk_importance_matrix)
+```
+
+Below we can see MRI Latent significance
+
+```{r}
+# xgb with mri latent and cluster
+mri_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/mri_latent.csv")
+mri_data$cluster <- factor(mri_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+mri_xgb <- train_xgb_model(mri_data)
+mri_importance_matrix <- xgb.importance(model = mri_xgb$model)
+print(mri_importance_matrix)
+xgb.plot.importance(mri_importance_matrix)
+```
+
+Below we can see MRI-Risk Latent significance
+
+```{r}
+# xgb with mri-risk latent and cluster
+mri_risk_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-8/mri_risk_latent.csv")
+mri_risk_data$cluster <- factor(mri_risk_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+mri_risk_xgb <- train_xgb_model(mri_risk_data)
+mri_risk_importance_matrix <- xgb.importance(model = mri_risk_xgb$model)
+print(mri_risk_importance_matrix)
+xgb.plot.importance(mri_risk_importance_matrix)
+```
+
+```{r}
+# AUC
+auc_data <- data.frame(
+  Model = rep(c("cg_xgb", "csf_xgb", "pet_xgb", "mri_xgb", "risk_xgb"), each = 4),
+  Class = rep(c("Class_0", "Class_1", "Class_2", "Class_3"), times = 5),
+  AUC = c(cg_xgb$auc, csf_xgb$auc, pet_xgb$auc, mri_xgb$auc, risk_xgb$auc)
+)
+
+class_mapping <- c("Class_0" = "Stable", "Class_1" = "Mild Progression", "Class_2" = "Moderate Progression", "Class_3" = "Severe Progression")
+auc_data$Class <- class_mapping[auc_data$Class]
+
+ggplot(auc_data, aes(x = Model, y = AUC, fill = Class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "AUC Comparison Across Models and Classes", x = "Model", y = "AUC") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+Below are the Cognitive AUC
+```{r}
+cg_xgb$auc
+```
+
+Below are the CSF AUC
+```{r}
+csf_xgb$auc
+```
+
+Below are the PET AUC
+```{r}
+pet_xgb$auc
+```
+
+Below are the Risk AUC
+```{r}
+risk_xgb$auc
+```
+
+Below are the MRI AUC
+```{r}
+mri_xgb$auc
+```
+
+Below are the MRI - Risk AUC
+```{r}
+mri_risk_xgb$auc
+```

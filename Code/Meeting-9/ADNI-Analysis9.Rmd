@@ -1,0 +1,119 @@
+---
+title: "ADNI-Analysis9"
+output: html_document
+date: "2024-12-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(readr)
+library(stats)
+```
+
+Read data
+
+```{r}
+read_data <- function(csv) {
+  data <- read_csv(csv)
+  return(data)
+}
+```
+
+```{r}
+pca_percentage <- function(data) {
+  # Drop columns that contain only zeros
+  data_filtered <- data %>% select(where(~ !all(. == 0)))
+  
+  # Perform PCA
+  pca <- prcomp(data_filtered, center = TRUE, scale. = TRUE)
+  explained_variance_ratio <- pca$sdev^2 / sum(pca$sdev^2)
+  cumulative_variance_ratio <- cumsum(explained_variance_ratio)
+
+  # Print variance explained by each component
+  for (i in seq_along(explained_variance_ratio)) {
+    cat(sprintf("Principal Component %d: %.2f%% of the variance\n", i, explained_variance_ratio[i] * 100))
+  }
+  cat(sprintf("Cumulative Variance Explained: %.2f%%\n", cumulative_variance_ratio[length(cumulative_variance_ratio)] * 100))
+}
+```
+
+```{r}
+# Initalize PCA
+init_pca <- function(data) {
+  data_without_label <- data %>% select(-cluster)
+  
+  data_filtered <- data_without_label %>% select(where(~ !all(. == 0)))
+  
+  pca <- prcomp(data_filtered, center = TRUE, scale. = TRUE)
+  latent_pca <- as.data.frame(pca$x[, 1:2])
+  return(latent_pca)
+}
+
+# Function to plot PCA results
+plot_pca <- function(name, pca_result, labels) {
+  pca_result <- cbind(pca_result, label = as.factor(labels))
+  ggplot(pca_result, aes(x = PC1, y = PC2, color = label)) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_viridis_d() +
+    labs(title = name, x = "PCA Component 1", y = "PCA Component 2", color = "Label") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+In this week, we will try to reduce dimension that we have, from 4 latent space dimension, we will try to reduce it to 2 and then show the result. First with cognitive score.
+
+```{r}
+cg_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/cg_latent.csv')
+pca_percentage(cg_latent %>% select(-cluster))
+cg_pca <- init_pca(cg_latent)
+plot_pca("PCA Components CG", cg_pca, cg_latent$cluster)
+```
+
+Second with CSF data.
+
+```{r}
+csf_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/csf_latent.csv')
+pca_percentage(csf_latent %>% select(-cluster))
+csf_pca <- init_pca(csf_latent)
+plot_pca("PCA Components CSF", csf_pca, csf_latent$cluster)
+```
+
+Third with PET.
+
+```{r}
+pet_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/pet_latent.csv')
+pca_percentage(pet_latent %>% select(-cluster))
+pet_pca <- init_pca(pet_latent)
+plot_pca("PCA Components PET", pet_pca, pet_latent$cluster)
+```
+
+Then risk factor patient have.
+
+```{r}
+risk_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/risk_latent.csv')
+pca_percentage(risk_latent %>% select(-cluster))
+risk_pca <- init_pca(risk_latent)
+plot_pca("PCA Components Risk", risk_pca, risk_latent$cluster)
+```
+
+Then MRI part.
+
+```{r}
+mri_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/mri_latent.csv')
+pca_percentage(mri_latent %>% select(-cluster))
+mri_pca <- init_pca(mri_latent)
+plot_pca("PCA Components MRI", mri_pca, mri_latent$cluster)
+```
+
+Lastly we will merge both mri and risk factor.
+
+```{r}
+mri_risk_latent <- read_data('/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/mri_risk_latent.csv')
+pca_percentage(mri_risk_latent %>% select(-cluster))
+mri_risk_pca <- init_pca(mri_risk_latent)
+plot_pca("PCA Components MRI-Risk", mri_risk_pca, mri_risk_latent$cluster)
+```

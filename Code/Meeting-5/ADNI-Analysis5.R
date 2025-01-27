@@ -1,0 +1,88 @@
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+data <- data %>%
+  filter(!is.na(WholeBrain))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+normalize_minmax <- function(x) {
+  return ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+}
+
+sort_viscode <- function(viscode, months, cdrsb) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices]
+  )
+}
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+
+# Function to run k-means and perform the Kruskal-Wallis test for each K
+get_kruskal_pvalue <- function(data, k) {
+  time_series_data <- data$cdrsb_scores
+  
+  dtw_kmeans_result <- tsclust(time_series_data, 
+                               type = "partitional",  # Partitional clustering (k-means)
+                               k = k,                 # Number of clusters (adjust k as needed)
+                               distance = "dtw",      # Use DTW as distance metric
+                               centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                               seed = 123)            # Seed for reproducibility
+  
+  cluster_assignments <- dtw_kmeans_result@cluster
+  data$cluster <- as.factor(cluster_assignments)
+  data <- data %>%
+    mutate(cdrsb_mean = map_dbl(cdrsb_scores, ~ mean(unlist(.))))
+  kruskal_test <- kruskal.test(cdrsb_mean ~ cluster, data = data)
+  
+  # Return the p-value from the test
+  return(kruskal_test$p.value)
+}
+
+# Run Kruskal-Wallis test for each K from 2 to 10
+kruskal_values <- sapply(2:10, function(k) get_kruskal_pvalue(grouped_data, k))
+
+# Create a dataframe for plotting
+pvalue_df <- data.frame(
+  K = 2:10,
+  P_value = kruskal_values
+)
+
+# Plot the p-values against the number of clusters K
+ggplot(pvalue_df, aes(x = K, y = P_value)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Kruskal-Wallis Test P-values for Different K Values",
+       x = "Number of Clusters (K)",
+       y = "P-value") +
+  theme_minimal()

@@ -1,0 +1,382 @@
+---
+title: "ADNI-Analysis3"
+output: html_document
+date: "2024-09-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("stringr")
+library("lmtest")
+library("stargazer")
+library("purrr")
+library("tidyr")
+library("dtw")
+```
+
+## ADNI Analysis Part 3
+
+```{r}
+# load data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+data <- data %>%
+  filter(!is.na(WholeBrain)) %>%
+  mutate(
+    Ventricles_percent = (Ventricles / ICV),
+    Hippocampus_percent = (Hippocampus / ICV),
+    WholeBrain_percent = (WholeBrain / ICV),
+    Entorhinal_percent = (Entorhinal / ICV),
+    Fusiform_percent = (Fusiform / ICV),
+    MidTemp_percent = (MidTemp / ICV)
+  )
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+sort_viscode <- function(viscode, months, cdrsb, brainVolumes, hippocampus, ventricles) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices],
+    brain_volumes = brainVolumes[sorted_indices],
+    hippocampus_volumes = hippocampus[sorted_indices],
+    ventricles_volumes = ventricles[sorted_indices]
+  )
+}
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB),
+    brain_volumes = list(WholeBrain_percent),
+    hippocampus_volumes = list(Hippocampus_percent),
+    ventricles_volumes = list(Ventricles_percent)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores, brain_volumes, hippocampus_volumes, ventricles_volumes), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted"),
+    brain_volumes = map(sorted, "brain_volumes"),
+    hippocampus_volumes = map(sorted, "hippocampus_volumes"),
+    ventricles_volumes = map(sorted, "ventricles_volumes"),
+  ) %>%
+  select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+```
+
+First after load the data, we want to try to search if there is a patient that has cdrsb value fluctuated, here what i have in mind as a standard is difference between first and last cdrsb below 1, but standard deviation above 1. There is no specific reason to have this standard, it just has good amount of data when I tested.
+
+```{r}
+# try to get fluctuating data
+summary_table <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    cdrsb_scores = cdrsb_scores,
+    months = months,
+    visits = map_int(cdrsb_scores, length)
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd, cdrsb_scores, months, visits)
+
+threshold_diff <- 1
+threshold_sd <- 1
+fluctuating_data <- summary_table %>%
+  filter(abs(cdrsb_first - cdrsb_last) < threshold_diff & cdrsb_sd > threshold_sd)
+
+plot_data <- fluctuating_data %>%
+  unnest(c(cdrsb_scores, months))  # Unnest the list columns
+
+ggplot(plot_data, aes(x = months, y = cdrsb_scores, group = PTID, color = PTID)) +
+  geom_line() +
+  labs(title = "CDRSB Progression Over Time by Patient",
+       x = "Months", y = "CDRSB Score") +
+  theme_minimal() +
+  theme(legend.position = "none")  # Hide legend for individual patients
+```
+
+We can see we have 10 patients that cdrsb value fluctuated. So we will use this to see if clustering we did have different results.
+
+```{r}
+perform_clustering <- function(summary_data, centers = 4, seed = 123) {
+  # Clean the data
+  cleaned_summary_table <- summary_data %>%
+    drop_na()
+  
+  # Set seed for reproducibility
+  set.seed(seed)
+  
+  # Perform k-means clustering
+  kmeans_result <- kmeans(cleaned_summary_table %>% select(-PTID), centers = centers)
+  
+  # Add cluster results to the summary table
+  cleaned_summary_table <- cleaned_summary_table %>%
+    mutate(cluster = kmeans_result$cluster)
+  
+  grouped_data_with_clusters <- grouped_data %>%
+    left_join(cleaned_summary_table %>% select(PTID, cluster), by = "PTID")
+  
+  return(list(kmeans_result = kmeans_result, grouped_data_with_clusters = grouped_data_with_clusters))
+}
+```
+
+```{r}
+# Clustering with only first and last cdrsb
+summary_table_1 <- grouped_data %>%
+  mutate(    
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)])        
+  ) %>%
+  select(PTID, cdrsb_first, cdrsb_last)
+
+result_1 <- perform_clustering(summary_table_1)
+grouped_data_with_clusters <- result_1$grouped_data_with_clusters
+
+long_data_1 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores, brain_volumes, hippocampus_volumes, ventricles_volumes))
+
+long_data_1 <- long_data_1 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable")))
+
+ggplot(long_data_1, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+The first clustering that I did here is just using the first and last cdrsb scores of each patients. I cannot use the whole list because each patient don't have the same visits. Of course this cannot capture how the cdrsb score fluctuated across time, but we can still use this to compare with other clustering later on.
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_1 %>% select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+From the first clusters which we are using only first and last cdrsb value, somehow the second until seventh patient got classified as severe progression even though they have low first and last cdrsb value.
+
+```{r}
+# Clustering with only mean and sd
+summary_table_2 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE)              
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_sd)
+
+result_2 <- perform_clustering(summary_data = summary_table_2)
+grouped_data_with_clusters <- result_2$grouped_data_with_clusters
+
+long_data_2 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores, brain_volumes, hippocampus_volumes, ventricles_volumes))
+
+long_data_2 <- long_data_2 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable")))
+
+ggplot(long_data_2, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+The second clustering that I did here is just using the mean and sd cdrsb scores of each patients. This might capture the trajectory of each patient cdrsb value better, but we cannot see if the patient get worst at the very end of the visit only, but we can see the distribution above seems pretty nice and evenly divided compare to the first one.
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_2 %>% select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+On the second clustering here, where we are using mean and sd of the cdrsb scores, we can see some changes, most notable on second to seventh patient where its not severe anymore, but stable and mild progression.
+
+```{r}
+# Cluster with first, last, mean, and sd of cdrsb
+summary_table_3 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE)              
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd)
+
+result_3 <- perform_clustering(summary_data = summary_table_2)
+grouped_data_with_clusters <- result_3$grouped_data_with_clusters
+
+long_data_3 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores, brain_volumes, hippocampus_volumes, ventricles_volumes))
+
+long_data_3 <- long_data_3 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable")))
+
+ggplot(long_data_3, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+The third one is actually the one that I used last week, using first and last value of the cdrsb also combine with the mean and standard deviation. By using this I'm thinking that it can capture the fluctuate category better as it also has the mean and standard deviation. But after discussion this one missing the time element of the patient, so patient that only come on 2 visits can still be categorized stable even though he/she only attend maybe first 6 months, compare to patients that attend the test across maybe 100 months.
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_3 %>% select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+When we combine both first, last, mean, and sd of the cdrsb values, we can see that patient number 2 to 7 are stable.
+
+```{r}
+# Cluster with first, last, mean, sd, number of visit, month diff
+summary_table_4 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    visits_count = map_int(cdrsb_scores, length),
+    months_diff = map_dbl(months, ~ .x[length(.x)] - .x[1])
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd)
+
+result_4 <- perform_clustering(summary_data = summary_table_2)
+grouped_data_with_clusters <- result_4$grouped_data_with_clusters
+
+long_data_4 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores, brain_volumes, hippocampus_volumes, ventricles_volumes))
+
+long_data_4 <- long_data_4 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable")))
+
+ggplot(long_data_4, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_4 %>% select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+We see same result if we are using the visit count and month difference between first and last visit of the patients. Maybe these patients in general already have the stable values in the first place, become we can see that number 2 to 7 have very low first and last cdrsb, then mean pretty low, but sd considerably pretty high. In general the number of visits they have is also not that big, range from 3 to 11.
+
+We can also try to see if the clustering we did before is actually really good or not by using Within-Cluster Sum of Squares.
+
+```{r}
+wcss_1 <- sum(result_1$kmeans_result$withinss) 
+wcss_2 <- sum(result_2$kmeans_result$withinss)
+wcss_3 <- sum(result_3$kmeans_result$withinss)
+wcss_4 <- sum(result_4$kmeans_result$withinss)
+
+print(wcss_1)
+print(wcss_2)
+print(wcss_3)
+print(wcss_4)
+```
+
+The four WCSS results you have displayed indicate the within-cluster sum of squares (WCSS) for four different clustering outcomes. The first value, 3994.928, represents a higher WCSS compared to the other three identical values of 1601.997, which suggests that the first clustering result has less compact clusters, while the other three clustering results have more compact clusters (since their WCSS is lower). Typically, a lower WCSS value indicates that the data points within clusters are more tightly packed around their centroids.
+
+In summary, based on the WCSS, the first clustering seems less effective compared to the others, which show identical and lower WCSS, potentially suggesting better cluster compactness.
+
+```{r}
+# We can see the hclust for DTW
+cdrsb_scores_list <- grouped_data$cdrsb_scores
+
+# Now calculate pairwise DTW distances between each pair of patients
+dtw_distances <- matrix(0, nrow = length(cdrsb_scores_list), ncol = length(cdrsb_scores_list))
+
+for (i in 1:length(cdrsb_scores_list)) {
+  for (j in 1:length(cdrsb_scores_list)) {
+    alignment <- dtw(cdrsb_scores_list[[i]], cdrsb_scores_list[[j]])
+    dtw_distances[i, j] <- alignment$distance
+  }
+}
+
+hc <- hclust(as.dist(dtw_distances), method = "ward.D2")
+```
+
+Then here we are trying to make a DTW using hierircal clustering as we are using distance matrix. And the results of the clustering seems pretty complex so we prune the tree so it only has 4 clusters.
+
+```{r}
+num_clusters <- 4
+
+# Cut the dendrogram to form 'num_clusters' clusters
+clusters <- cutree(hc, k = num_clusters)
+
+# Create a data frame with PTID and their corresponding cluster
+ptid_cluster <- data.frame(
+  PTID = grouped_data$PTID,
+  Cluster = clusters
+)
+
+merged_data <- grouped_data %>%
+  left_join(ptid_cluster, by = "PTID") %>%
+  unnest(c(months, cdrsb_scores))
+
+ggplot(merged_data, aes(x = months, y = cdrsb_scores, group = PTID, color = as.factor(Cluster))) +
+  geom_line() +
+  labs(title = "CDRSB Progression by Cluster", x = "Months", y = "CDRSB Score", color = "Cluster") +
+  theme_minimal()
+
+```
+
+Here is how it looks with the 4 different clusters for the fluctuating data:
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(merged_data %>% select(PTID, Cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, Cluster) %>% distinct()
+```
+

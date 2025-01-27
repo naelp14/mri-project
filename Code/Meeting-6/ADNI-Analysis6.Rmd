@@ -1,0 +1,321 @@
+---
+title: "ADNI-Analysis6"
+output: html_document
+date: "2024-11-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+library("xgboost")
+library("caTools")
+library("caret")
+```
+
+```{r}
+normalize_minmax <- function(x) {
+  return ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+}
+
+sort_viscode <- function(viscode, months, cdrsb) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices]
+  )
+}
+```
+
+```{r}
+# Load data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv") %>%
+  filter(!is.na(WholeBrain))
+norm_data <- data %>% 
+  mutate(across(where(is.numeric), normalize_minmax))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+
+norm_filtered_data <- norm_data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+norm_grouped_data <- norm_filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+```
+
+```{r}
+# DTW
+time_series_data <- grouped_data$cdrsb_scores
+
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+cluster_assignments <- dtw_kmeans_result@cluster
+dtw_data <- grouped_data
+dtw_data$cluster <- as.factor(cluster_assignments)
+dtw_data <- dtw_data %>%
+  unnest(cols = c(months, cdrsb_scores))
+
+dtw_data <- dtw_data %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+
+```
+
+We can see dtw data on normal data.
+
+```{r}
+ggplot(dtw_data, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+```{r}
+time_series_data <- norm_grouped_data$cdrsb_scores
+
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+cluster_assignments <- dtw_kmeans_result@cluster
+norm_dtw_data <- norm_grouped_data
+norm_dtw_data$cluster <- as.factor(cluster_assignments)
+norm_dtw_data <- norm_dtw_data %>%
+  unnest(cols = c(months, cdrsb_scores))
+
+norm_dtw_data <- norm_dtw_data %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+```
+
+We can see below dtw data on normalized data.
+
+```{r}
+ggplot(norm_dtw_data, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+In this experiment we want to try to find variables that is significant to determine the cluster that we will use later on as predictor for the classification baseline. For the K means we will use the dTW one.
+
+```{r}
+# make sure to take only PTID and cluster
+filtered_dtw <- dtw_data %>%
+  dplyr::select(PTID, cluster) %>%
+  group_by(PTID) %>%
+  dplyr::slice(1)
+
+merged_data <- left_join(filtered_dtw, data, by = "PTID")
+
+# make sure to take only PTID and cluster
+norm_filtered_dtw <- norm_dtw_data %>%
+  dplyr::select(PTID, cluster) %>%
+  group_by(PTID) %>%
+  dplyr::slice(1)
+
+norm_merged_data <- left_join(norm_filtered_dtw, norm_data, by = "PTID")
+```
+
+Below we can see some results using ANOVA test, with null hypothesis is assumes there are no differences in mean of chosen variables values between clusters.
+
+```{r}
+# ANOVA cluster and APOE4
+anova_apoe4 <- aov(APOE4 ~ cluster, data = merged_data)
+summary(anova_apoe4)
+```
+
+ANOVA test using APOE4 showed the p-value below 0.05, means the differences are statistically significant, and the variable APOE4 is significantly related to the clusters.
+
+```{r}
+# ANOVA cluster and education
+anova_edu <- aov(PTEDUCAT ~ cluster, data = merged_data)
+summary(anova_edu)
+```
+
+ANOVA test using education showed the p-value below 0.05, means the differences are statistically significant, and the variable APOE4 is significantly related to the clusters..
+
+```{r}
+# ANOVA cluster and age
+anova_age <- aov(AGE ~ cluster, data = merged_data)
+summary(anova_age)
+```
+
+ANOVA test using age showed the p-value below 0.05, means the differences are statistically significant, and the variable APOE4 is significantly related to the clusters.
+
+```{r}
+# This to filter to show only 1 data
+first_occurrence <- merged_data %>%
+  group_by(PTID) %>% 
+  dplyr::slice(1) %>%
+  ungroup()
+
+first_occurrence <- first_occurrence %>%
+  dplyr::select(c(Month, AGE, PTEDUCAT, APOE4, CDRSB, ADAS11, ADAS13, ADASQ4, MMSE, RAVLT_learning, RAVLT_forgetting, RAVLT_immediate, LDELTOTAL, DIGITSCOR, TRABSCOR, FAQ, MOCA, WholeBrain, Entorhinal, Fusiform, Ventricles, Hippocampus, MidTemp, ICV, cluster))
+
+norm_first <- norm_merged_data %>%
+  group_by(PTID) %>% 
+  dplyr::slice(1) %>%
+  ungroup()
+
+norm_first_occurrence <- norm_first %>%
+  dplyr::select(c(Month, AGE, PTEDUCAT, APOE4, CDRSB, ADAS11, ADAS13, ADASQ4, MMSE, RAVLT_learning, RAVLT_forgetting, RAVLT_immediate, LDELTOTAL, DIGITSCOR, TRABSCOR, FAQ, MOCA, WholeBrain, Entorhinal, Fusiform, Ventricles, Hippocampus, MidTemp, ICV, cluster))
+```
+
+Next we want to try to find variables with XGBoost using data loaded without preprocessing.
+
+```{r}
+# xGB
+# Data Prep
+set.seed(123)
+sample_split <- sample.split(Y = first_occurrence$cluster, SplitRatio = 0.7)
+train_set <- subset(x = first_occurrence, sample_split == TRUE)
+test_set <- subset(x = first_occurrence, sample_split == FALSE)
+
+y_train <- as.integer(train_set$cluster) - 1
+y_test <- as.integer(test_set$cluster) - 1
+X_train <- train_set %>% dplyr::select(-cluster)
+X_test <- test_set %>% dplyr::select(-cluster)
+
+# Modeling
+xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+xgb_params <- list(
+  booster = "gbtree",
+  eta = 0.01,
+  max_depth = 8,
+  gamma = 4,
+  subsample = 0.75,
+  colsample_bytree = 1,
+  objective = "multi:softprob",
+  eval_metric = "mlogloss",
+  num_class = length(levels(first_occurrence$cluster))
+)
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = xgb_train,
+  nrounds = 5000,
+  verbose = 1
+)
+xgb_model
+```
+
+Below the result of xgb using raw data.
+
+```{r}
+# Find importance of the variable
+importance_matrix <- xgb.importance(model = xgb_model)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix)
+```
+
+Below the result of xgb using normalizeds data.
+
+```{r}
+# xGB
+# Data Prep
+set.seed(123)
+sample_split <- sample.split(Y = norm_first_occurrence$cluster, SplitRatio = 0.7)
+train_set <- subset(x = norm_first_occurrence, sample_split == TRUE)
+test_set <- subset(x = norm_first_occurrence, sample_split == FALSE)
+
+y_train <- as.integer(train_set$cluster) - 1
+y_test <- as.integer(test_set$cluster) - 1
+X_train <- train_set %>% dplyr::select(-cluster)
+X_test <- test_set %>% dplyr::select(-cluster)
+
+# Modeling
+xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+xgb_params <- list(
+  booster = "gbtree",
+  eta = 0.01,
+  max_depth = 8,
+  gamma = 4,
+  subsample = 0.75,
+  colsample_bytree = 1,
+  objective = "multi:softprob",
+  eval_metric = "mlogloss",
+  num_class = length(levels(first_occurrence$cluster))
+)
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = xgb_train,
+  nrounds = 5000,
+  verbose = 1
+)
+xgb_model
+
+# Find importance of the variable
+importance_matrix <- xgb.importance(model = xgb_model)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix)
+```

@@ -1,0 +1,388 @@
+---
+title: "ADNI-Analysis4-2"
+output: html_document
+date: "2024-10-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("stringr")
+library("lmtest")
+library("stargazer")
+library("purrr")
+library("tidyr")
+library("dtwclust")
+library("clusterSim")
+```
+
+## ADNI Analysis Part 4-2
+
+```{r}
+# load data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+data <- data %>%
+  filter(!is.na(WholeBrain))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+normalize_minmax <- function(x) {
+  return ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+}
+
+sort_viscode <- function(viscode, months, cdrsb) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices]
+  )
+}
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+```
+
+That being said on the second part of the analysis we are trying to find the best k using original data and try to use the one that also include time in the clustering method. But we also keep the one that without time just in case.
+
+```{r}
+# try to get fluctuating data
+summary_table <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    cdrsb_scores = cdrsb_scores,
+    months = months,
+    visits = map_int(cdrsb_scores, length)
+  ) 
+
+threshold_diff <- 1
+threshold_sd <- 1
+fluctuating_data <- summary_table %>%
+  filter(abs(cdrsb_first - cdrsb_last) < threshold_diff & cdrsb_sd > threshold_sd)
+
+plot_data <- fluctuating_data %>%
+  unnest(c(cdrsb_scores, months))  # Unnest the list columns
+
+ggplot(plot_data, aes(x = months, y = cdrsb_scores, group = PTID, color = PTID)) +
+  geom_line() +
+  labs(title = "CDRSB Progression Over Time by Patient",
+       x = "Months", y = "CDRSB Score") +
+  theme_minimal() +
+  theme(legend.position = "none")  # Hide legend for individual patients
+```
+
+We can see we have 10 patients that cdrsb value fluctuated. So we will use this to see if clustering we did have different results.
+
+```{r}
+perform_clustering <- function(summary_data, centers = 4, seed = 123) {
+  # Clean the data
+  cleaned_summary_table <- summary_data %>%
+    drop_na()
+  
+  # Set seed for reproducibility
+  set.seed(seed)
+  
+  # Perform k-means clustering
+  kmeans_result <- kmeans(cleaned_summary_table %>% dplyr::select(-PTID), centers = centers)
+  
+  # Add cluster results to the summary table
+  cleaned_summary_table <- cleaned_summary_table %>%
+    mutate(cluster = kmeans_result$cluster)
+  
+  grouped_data_with_clusters <- grouped_data %>%
+    left_join(cleaned_summary_table %>% dplyr::select(PTID, cluster), by = "PTID")
+  
+  return(list(kmeans_result = kmeans_result, grouped_data_with_clusters = grouped_data_with_clusters))
+}
+```
+
+```{r}
+# Cluster with first, last, mean, and sd of cdrsb
+summary_table_3 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE)              
+  ) %>%
+  dplyr::select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd)
+
+result_3 <- perform_clustering(summary_data = summary_table_3)
+grouped_data_with_clusters <- result_3$grouped_data_with_clusters
+
+long_data_3 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores))
+
+long_data_3 <- long_data_3 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable")))
+
+ggplot(long_data_3, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_3 %>% dplyr::select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% dplyr::select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+Using this model we want to try to find the best K using elbow method.
+```{r}
+cleaned_summary_table <- summary_table_3 %>%
+    drop_na() %>% 
+  dplyr::select(-PTID)
+  
+set.seed(123)
+
+wcss <- function(data, k) {
+  kmeans_result <- kmeans(data, centers = k, nstart = 25)
+  return(kmeans_result$tot.withinss)
+}
+
+wcss_values <- sapply(2:10, function(k) wcss(cleaned_summary_table, k))
+
+# Step 4: Plot the WCSS vs. the number of clusters (k)
+plot(2:10, wcss_values, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (k)",
+     ylab = "Within-Cluster Sum of Squares (WCSS)",
+     main = "Elbow Method for Determining Optimal k")
+```
+
+From the elbow plot above, we can see that 4 clusters might be optimal, we can see the marginal improvements after that is not much. Therefore, choosing 4 clusters balances cluster compactness and complexity effectively. This support our experiment that use k=4 from the start. Then we want to try to verify if we can see differnet result using Davies Bouldin Index.
+
+```{r}
+k_range <- 2:10
+
+# Initialize a vector to store Davies-Bouldin Index (DBI) for each K
+dbi_values <- numeric(length(k_range))
+
+for (i in seq_along(k_range)) {
+  k <- k_range[i]
+  kmeans_result <- kmeans(cleaned_summary_table, centers = k, nstart = 25)
+  dbi_values[i] <- index.DB(cleaned_summary_table, kmeans_result$cluster)$DB
+}
+
+# Print the DBI values for each K
+print(data.frame(K = k_range, DBI = dbi_values))
+
+plot(k_range, dbi_values, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (K)", ylab = "Davies-Bouldin Index",
+     main = "Davies-Bouldin Index vs. Number of Clusters")
+```
+
+While the DBI leans toward K=2 for optimal clustering, the Elbow Method’s result of K=4 might still be more useful for capturing the nuances in the data, especially if domain knowledge supports this interpretation. Balancing both insights, K=4 may offer a more detailed breakdown, while K=2 provides a more generalized grouping.
+
+```{r}
+# Cluster with first, last, mean, sd, number of visit, month diff
+summary_table_4 <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    visits_count = map_int(cdrsb_scores, length),
+    months_diff = map_dbl(months, ~ .x[length(.x)] - .x[1])
+  ) %>%
+  dplyr::select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd, visits_count, months_diff)
+
+result_4 <- perform_clustering(summary_data = summary_table_4)
+grouped_data_with_clusters <- result_4$grouped_data_with_clusters
+
+long_data_4 <- grouped_data_with_clusters %>%
+  unnest(c(months, cdrsb_scores))
+
+long_data_4 <- long_data_4 %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Moderate Progression", 
+                                     "Severe Progression", 
+                                     "Stable", 
+                                     "Mild Progression")))
+
+ggplot(long_data_4, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+I just realized that I made an error by not including the months and visits count, so the result now after actually include that 2 parts show really different results, patients with a shorter time frame but a significant increase in CDRSB scores are now correctly classified under the "Severe Progression" cluster. On the other hand, patients who started with low CDRSB scores and gradually progressed over a longer time span have been grouped in the "Stable" cluster. This adjustment allows us to better differentiate between rapid deterioration and slower, more stable cognitive decline over time, offering a clearer insight into the different progression types.
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_4 %>% dplyr::select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% dplyr::select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+```{r}
+time_series_data <- grouped_data$cdrsb_scores
+
+# Perform k-means clustering using DTW
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+# Print the clustering results
+print(dtw_kmeans_result)
+```
+
+Then here we are trying to do K-Means but also try to accomodate the time series data using DTW.
+
+```{r}
+cluster_assignments <- dtw_kmeans_result@cluster
+
+# Add these cluster assignments back to your dataframe
+grouped_data$cluster <- as.factor(cluster_assignments)
+
+# View the first few results
+head(grouped_data)
+```
+
+```{r}
+grouped_data_long <- grouped_data %>%
+  unnest(cols = c(months, cdrsb_scores))
+
+grouped_data_long <- grouped_data_long %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+
+# Plot the CDRSB progression over time, colored by cluster
+ggplot(grouped_data_long, aes(x = months, y = cdrsb_scores, group = PTID, color = cluster)) +
+  geom_line() +
+  labs(title = "CDRSB Progression by DTW-Based Clusters",
+       x = "Months",
+       y = "CDRSB Score") +
+  theme_minimal()
+```
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(long_data_4 %>% dplyr::select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% dplyr::select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+Using the DTW k means, the result of the progression based on the fluctuating data is just weird, maybe in the end we need to do the normalization first before going to the k means, so i will try to do normalization again.
+
+```{r}
+# Normalize the data
+data_norm <- data %>%
+  mutate(across(where(is.numeric), normalize_minmax))
+
+filtered_data_norm <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+grouped_data_norm <- filtered_data_norm %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+
+time_series_data <- grouped_data_norm$cdrsb_scores
+
+# Perform k-means clustering using DTW
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+# Print the clustering results
+print(dtw_kmeans_result)
+```
+
+
+```{r}
+# redo the alignment for k means dtw with normalized data
+cluster_assignments <- dtw_kmeans_result@cluster
+
+# Add these cluster assignments back to your dataframe
+grouped_data_norm$cluster <- as.factor(cluster_assignments)
+
+# View the first few results
+head(grouped_data_norm)
+```
+
+```{r}
+grouped_data_long <- grouped_data_norm %>%
+  unnest(cols = c(months, cdrsb_scores))
+
+grouped_data_long <- grouped_data_long %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+
+# Plot the CDRSB progression over time, colored by cluster
+ggplot(grouped_data_long, aes(x = months, y = cdrsb_scores, group = PTID, color = cluster)) +
+  geom_line() +
+  labs(title = "CDRSB Progression by DTW-Based Clusters",
+       x = "Months",
+       y = "CDRSB Score") +
+  theme_minimal()
+```
+
+In the end, we can see that using the CDRSB mean, standard deviation, first, and last values for clustering provides the best result so far. When comparing the outcome usiinstall.packages("clusterSim")ng human analysis, this method aligns well with the cognitive progression patterns we expect to see in patients. Although we explored advanced techniques like Dynamic Time Warping (DTW), which accounts for time variations between visits, the results were not significantly better than the simpler method. The DTW-based clustering struggled with variability in time gaps between visits and did not capture progression trends as effectively as the CDRSB statistical summary approach. Therefore, even though DTW is a powerful tool for time series, in this case, the straightforward use of statistical summaries (mean, SD, etc.) of CDRSB scores outperformed it in terms of clarity and clinical relevance, making it the best choice for now.

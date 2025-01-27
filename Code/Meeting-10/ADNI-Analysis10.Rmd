@@ -1,0 +1,252 @@
+---
+title: "ADNI-Analysis10"
+output: html_document
+date: "2025-01-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+library("xgboost")
+library("caTools")
+library("caret")
+library("pROC")
+library("plotly")
+```
+
+## R Markdown
+We will redo the work we did in the Analysis 9-2. Instead of using 2d plot, we will use 3d plot, and also include all latent in the linear regression.
+
+```{r}
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-9/ADNIMERGE-dtw.csv")
+```
+
+```{r}
+train_xgb_model <- function(data) {
+  # Ensure correct levels for `cluster`
+  data$cluster <- factor(data$cluster, levels = c("Stable", "Mild Progression", "Moderate Progression", "Severe Progression"))
+  
+  # Split data
+  set.seed(123)
+  sample_split <- sample.split(Y = data$cluster, SplitRatio = 0.7)
+  train_set <- subset(data, sample_split == TRUE)
+  test_set <- subset(data, sample_split == FALSE)
+  
+  # Prepare labels and features
+  y_train <- as.integer(train_set$cluster) - 1
+  y_test <- as.integer(test_set$cluster) - 1
+  X_train <- train_set %>% dplyr::select(-cluster) %>% as.data.frame() %>% mutate_all(as.numeric)
+  X_test <- test_set %>% dplyr::select(-cluster) %>% as.data.frame() %>% mutate_all(as.numeric)
+  
+  # Convert to xgb.DMatrix
+  xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+  
+  # Set parameters
+  num_classes <- length(unique(y_train))  # Ensure correct num_class
+  xgb_params <- list(
+    booster = "gbtree",
+    eta = 0.01,
+    max_depth = 8,
+    gamma = 4,
+    subsample = 0.75,
+    colsample_bytree = 1,
+    objective = "multi:softprob",
+    eval_metric = "mlogloss",
+    num_class = num_classes
+  )
+  
+  # Train the model
+  xgb_model <- xgb.train(
+    params = xgb_params,
+    data = xgb_train,
+    nrounds = 5000,
+    verbose = 1
+  )
+  
+  # Predict and calculate AUC
+  pred_probs <- predict(xgb_model, newdata = xgb_test)
+  pred_probs <- matrix(pred_probs, ncol = num_classes, byrow = TRUE)
+  auc_values <- sapply(0:(num_classes - 1), function(class) {
+    binary_labels <- ifelse(y_test == class, 1, 0)
+    roc_obj <- roc(binary_labels, pred_probs[, class + 1])
+    auc(roc_obj)
+  })
+  
+  names(auc_values) <- paste("AUC_Class", 0:(num_classes - 1), sep = "_")
+  
+  # Return the model and AUC
+  return(list(model = xgb_model, auc = auc_values))
+}
+
+```
+
+Starting with Cognitive set
+
+```{r}
+cg_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-10/cg_latent.csv")
+cg_data$cluster <- factor(cg_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+cg_xgb <- train_xgb_model(cg_data)
+cg_importance_matrix <- xgb.importance(model = cg_xgb$model)
+print(cg_importance_matrix)
+xgb.plot.importance(cg_importance_matrix)
+```
+
+```{r}
+plot_ly(cg_data, 
+        x = ~latent_4, 
+        y = ~latent_1, 
+        z = ~latent_2, 
+        color = ~as.factor(cluster), 
+        type = "scatter3d", 
+        mode = "markers")
+
+```
+
+Cognitive set linear regression with Age
+
+```{r}
+cg_data <- cg_data %>% dplyr:::select(-cluster)
+cg_sets <- cbind(data, cg_data)
+cg_sets <- cg_sets[!is.na(cg_sets$AGE) & !is.infinite(cg_sets$AGE), ]
+cg_sets$cluster_set <- as.numeric(factor(cg_sets$cluster))
+model <- lm(AGE ~ latent_1+ latent_2 + latent_3 + latent_4 + cluster_set, data = cg_sets)
+summary(model)
+```
+
+Cognitive set linear regression with Gender
+
+```{r}
+cg_sets$gender <- as.numeric(factor(cg_sets$PTGENDER))
+model <- lm(gender ~ latent_1+ latent_2 + latent_3 + latent_4 + cluster_set, data = cg_sets)
+summary(model)
+```
+
+Cognitive set linear regression with APOE4
+
+```{r}
+model <- lm(APOE4 ~ latent_1+ latent_2 + latent_3 + latent_4 + cluster_set, data = cg_sets)
+summary(model)
+```
+
+Moving on to the csf set
+
+```{r}
+csf_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-10/csf_latent.csv")
+csf_data$cluster <- factor(csf_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+csf_xgb <- train_xgb_model(csf_data)
+csf_importance_matrix <- xgb.importance(model = csf_xgb$model)
+print(csf_importance_matrix)
+xgb.plot.importance(csf_importance_matrix)
+```
+
+As there is still 2 latent spaces here, so we won't redo the csf part
+
+```{r}
+ggplot(csf_data, aes(x = latent_4, y = latent_1, color = as.factor(cluster))) +
+  geom_point() +
+  labs(title = "Latent Space: Latent_4 vs Latent_1 (Clustered)",
+       x = "Latent_4",
+       y = "Latent_1",
+       color = "Cluster") +
+  theme_minimal()
+```
+
+Plotting 3D the PET set
+
+```{r}
+pet_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-10/pet_latent.csv")
+pet_data$cluster <- factor(pet_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+pet_xgb <- train_xgb_model(pet_data)
+pet_importance_matrix <- xgb.importance(model = pet_xgb$model)
+print(pet_importance_matrix)
+xgb.plot.importance(pet_importance_matrix)
+```
+
+```{r}
+plot_ly(pet_data, 
+        x = ~latent_1, 
+        y = ~latent_2, 
+        z = ~latent_4, 
+        color = ~as.factor(cluster), 
+        type = "scatter3d", 
+        mode = "markers")
+
+```
+
+Next to the PET regression
+
+```{r}
+pet_data <- pet_data %>% dplyr:::select(-cluster)
+pet_sets <- cbind(data, pet_data)
+pet_sets$cluster_set <- as.numeric(factor(pet_sets$cluster))
+model <- lm(AGE ~ latent_1 + latent_2 + latent_4 + cluster_set, data = pet_sets)
+summary(model)
+```
+
+```{r}
+pet_sets$gender <- as.numeric(factor(pet_sets$PTGENDER))
+model <- lm(gender ~ latent_1 + latent_2 + latent_4 + cluster_set, data = pet_sets)
+summary(model)
+```
+
+```{r}
+model <- lm(APOE4 ~ latent_1 + latent_2 + latent_4 + cluster_set, data = pet_sets)
+summary(model)
+```
+
+Moving on to risk set
+
+```{r}
+risk_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-10/risk_latent.csv")
+risk_data$cluster <- factor(risk_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+risk_xgb <- train_xgb_model(risk_data)
+risk_importance_matrix <- xgb.importance(model = risk_xgb$model)
+print(risk_importance_matrix)
+xgb.plot.importance(risk_importance_matrix)
+```
+
+```{r}
+plot_ly(risk_data, 
+        x = ~latent_1, 
+        y = ~latent_3, 
+        z = ~latent_4, 
+        color = ~as.factor(cluster), 
+        type = "scatter3d", 
+        mode = "markers")
+
+```
+
+```{r}
+mri_risk_data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/Meeting-10/mri_risk_latent.csv")
+mri_risk_data$cluster <- factor(mri_risk_data$cluster, 
+                           levels = c(0, 1, 2, 3), 
+                           labels = c("Mild Progression", "Moderate Progression", "Severe Progression","Stable"))
+mri_risk_xgb <- train_xgb_model(mri_risk_data)
+mri_risk_importance_matrix <- xgb.importance(model = mri_risk_xgb$model)
+print(mri_risk_importance_matrix)
+xgb.plot.importance(mri_risk_importance_matrix)
+```
+
+```{r}
+plot_ly(mri_risk_data, 
+        x = ~latent_1, 
+        y = ~latent_2, 
+        z = ~latent_3, 
+        color = ~as.factor(cluster), 
+        type = "scatter3d", 
+        mode = "markers")
+
+```

@@ -1,0 +1,480 @@
+---
+title: "ADNI Data Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir="/Users/nathaniel.putera/Projects/UCPH/MRI-Project")
+library("ggplot2")
+library("dplyr")
+library("stringr")
+library("stargazer")
+library("lmtest")
+```
+
+# Part 1: ADNI data analysis
+
+```{r}
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+```
+
+```{r}
+unique_data <- data[!duplicated(data$PTID), ]
+gender_data <- unique_data[c("PTID", "PTGENDER")]
+ad_patients <- unique_data %>%
+  filter(DX == "AD")
+
+gender_distribution <- table(unique_data$PTGENDER)
+
+ggplot(data = as.data.frame(gender_distribution), aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Gender Distribution by Unique Patient", x = "Gender", y = "Count") +
+  theme_bw()
+```
+
+From the data we can see the gender distribution between Male and Female almost similar.
+
+```{r}
+age_distribution_filtered <- unique_data %>%
+  select(AGE, DX) %>%
+  filter(!is.na(AGE) & !is.na(DX)) %>%
+  filter(DX != "")
+
+age_bins <- c(50, 60, 70, 80, 90, 100)
+age_labels <- c('50-59', '60-69', '70-79', '80-89', '90-99')
+
+age_distribution_filtered$AgeRange <- cut(age_distribution_filtered$AGE, breaks = age_bins, labels = age_labels, right = FALSE)
+
+age_range_counts <- age_distribution_filtered %>%
+  group_by(AgeRange) %>%
+  summarise(Count = n())
+ggplot(age_range_counts, aes(x = AgeRange, y = Count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Number of Patients in Each Age Range",
+       x = "Age Range",
+       y = "Count") +
+  theme_bw()
+```
+
+When we examine the age distribution of patients at their first visit, we observe that the age range 70-79 has the highest number of patients. The age range 60-69 follows, with a substantial number of patients as well. The 80-89 range has fewer patients, and the 50-59 and 90-99 ranges have the least. To gain deeper insights, we can further analyze the distribution of diagnoses within each age range.
+
+```{r}
+ggplot(age_distribution_filtered, aes(x = AgeRange, fill = DX)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Distribution of Diagnosis by Age",
+       x = "Age Range",
+       y = "Count",
+       fill = "Diagnosis") +
+  theme_bw()
+```
+
+When we examine the distribution of diagnoses across different age ranges at the patients' first visits, we observe that the group already diagnosed with Alzheimer's Disease (AD) is the smallest within each age range. In contrast, there are significant numbers of patients with Mild Cognitive Impairment (MCI) and those who are Cognitively Normal (CN). This indicates that many patients still have good cognitive function at their initial visit. It highlights the importance of monitoring and assessing these patients over time to understand the progression of cognitive health.
+
+```{r}
+total_marital_data <- unique_data %>%
+  select(PTID, PTMARRY) %>%
+  filter(PTMARRY != "" & PTMARRY != "Unknown")
+
+total_marital_distribution <- table(total_marital_data$PTMARRY)
+
+ad_marital_data <- ad_patients %>%
+  select(PTID, PTMARRY)
+ad_marital_distribution <- table(ad_marital_data$PTMARRY)
+combined_distribution <- rbind(total_marital_distribution, ad_marital_distribution)
+rownames(combined_distribution) <- c("Total", "Alzheimer's")
+
+combined_distribution_df <- as.data.frame(t(combined_distribution))
+
+print(combined_distribution_df)
+```
+
+From the marital status i don't think we can extract any information from this as more or less all has the same proportions.
+
+```{r}
+race_data <- unique_data[c("PTID", "PTRACCAT")]
+total_race_distribution <- table(race_data$PTRACCAT)
+
+ad_patients <- unique_data %>%
+  filter(DX == "AD" & !is.na(PTRACCAT))
+ad_race_distribution <- table(factor(ad_patients$PTRACCAT, levels = names(total_race_distribution)))
+
+combined_race_distribution <- data.frame(
+  Race = names(total_race_distribution),
+  Total = as.vector(total_race_distribution),
+  Alzheimer = as.vector(ad_race_distribution)
+)
+
+combined_race_distribution[is.na(combined_race_distribution)] <- 0
+combined_race_distribution
+```
+
+With the distribution table of the race here, some of the races only have a few data so we cannot really compare between each other. So we cannot really extract information from here.
+
+```{r}
+apoe4_data <- unique_data[c("PTID", "APOE4")]
+apoe4_distribution <- table(apoe4_data$APOE4)
+
+ad_patients <- unique_data %>%
+  filter(DX == "AD")
+ad_apoe4_data <- ad_patients %>%
+  select(PTID, APOE4) %>%
+  filter(!is.na(APOE4))
+ad_apoe4_distribition <- table(ad_apoe4_data$APOE4)
+combined_distribution <- rbind(apoe4_distribution, ad_apoe4_distribition)
+rownames(combined_distribution) <- c("Total_Patients", "Positive_AD")
+combined_distribution_df <- as.data.frame(t(combined_distribution))
+
+combined_distribution_df$Percentage <- combined_distribution_df$Positive_AD / combined_distribution_df$Total_Patients * 100
+print(combined_distribution_df)
+```
+
+The majority of the patients in our data do not carry any APOE4 protein alleles, which are associated with a higher risk of Alzheimer's disease. The second largest group consists of patients with one allele, indicating a higher risk of Alzheimer's. Finally, a smaller group of patients carries two alleles, putting them at the highest risk of developing Alzheimer's Disease.
+
+If we take a look at how many patients were actually diagnosed with Alzheimer's, we can see that among the 1200 patients who carry 0 APOE4 alleles, 127 patients (around 10%) have Alzheimer's. Among the patients who carry 1 allele, out of 803 individuals, 191 were diagnosed with Alzheimer's or about 23%, which is significantly more than the first group. In the last group, we see that 75 out of 211 patients who carry 2 alleles were diagnosed with Alzheimer's, roughly 30%.
+
+```{r}
+filtered_volume_data <- data %>%
+  filter(!is.na(VISCODE) & !is.na(WholeBrain) & !is.na(PTID))
+
+filtered_volume_data$VISCODE <- factor(filtered_volume_data$VISCODE, levels = unique(filtered_volume_data$VISCODE))
+
+ggplot(filtered_volume_data, aes(x = VISCODE, y = WholeBrain)) +
+  geom_boxplot() +
+  labs(title = "Box Plot of Whole Brain Volume by Visit",
+       x = "Visit Code (VISCODE)",
+       y = "Whole Brain Volume") +
+  theme_bw()
+
+filtered_volume_data$VISCODE_num <- ifelse(filtered_volume_data$VISCODE == "bl", -1, as.numeric(str_extract(filtered_volume_data$VISCODE, "\\d+")))
+unique_viscodes <- filtered_volume_data %>%
+  distinct(VISCODE, VISCODE_num) %>%
+  arrange(VISCODE_num) %>%
+  pull(VISCODE)
+
+filtered_volume_data$VISCODE <- factor(filtered_volume_data$VISCODE, levels = unique_viscodes)
+
+median_volume_by_viscode <- filtered_volume_data %>%
+  group_by(VISCODE) %>%
+  summarise(median_volume = median(WholeBrain, na.rm = TRUE))
+
+ggplot(median_volume_by_viscode, aes(x = VISCODE, y = median_volume)) +
+  geom_line(group = 1) +
+  geom_point() +
+  labs(title = "Median Whole Brain Volume by Visit",
+       x = "Visit Code (VISCODE)",
+       y = "Median Whole Brain Volume") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+The median whole brain volume shows an initial decline from baseline to early visits, indicating early brain volume loss in patients. Over time, there are significant fluctuations in the median brain volume, suggesting considerable variability among patients, with several sharp declines at specific visit codes. Towards the later visits, there is a noticeable increase in median brain volume, which may be due to a smaller patient sample with larger brain volumes remaining in the study. This lack of significant variation could be due to the fact that many patients only visit 3-4 times, leading to insufficient data to identify any meaningful trends.
+
+```{r}
+filtered_data <- data %>%
+  filter(!is.na(VISCODE) & !is.na(PTID))
+
+filtered_data$VISCODE_num <- ifelse(filtered_data$VISCODE == "bl", 0, as.numeric(str_extract(filtered_data$VISCODE, "\\d+")))
+
+filtered_data <- filtered_data %>%
+  group_by(PTID) %>%
+  mutate(VisitNumber = row_number())
+
+filtered_data <- filtered_data %>%
+  select(-VISCODE_num)
+
+median_volume_by_visit_number <- filtered_data %>%
+  group_by(VisitNumber) %>%
+  summarise(median_volume = median(WholeBrain, na.rm = TRUE))
+
+ggplot(median_volume_by_visit_number, aes(x = VisitNumber, y = median_volume)) +
+  geom_line(group = 1) + # group = 1 ensures it is treated as a continuous line
+  geom_point() +
+  labs(title = "Median Whole Brain Volume by Visit Number",
+       x = "Visit Number",
+       y = "Median Whole Brain Volume") +
+  theme_minimal()
+```
+
+As we go deeper into the data, this plot shows the median whole brain volume for each visit number, indicating the number of times patients have visited. We observe that the median brain volume initially fluctuates, with a slight upward trend until around the 10th visit. However, after the 10th visit, there is a noticeable decline in brain volume, reaching its lowest point around the 15th visit. This decline is followed by significant fluctuations, including sharp increases towards the 20th and 25th visits. This pattern suggests that while brain volume may remain relatively stable during early visits, it tends to decline over time, with considerable variability in the later stages. This information is crucial for understanding the progression of brain volume changes in patients over multiple visits.
+
+```{r}
+median_cdrsb_by_visit_number <- filtered_data %>%
+  group_by(VisitNumber) %>%
+  summarise(median_cdrsb = median(CDRSB, na.rm = TRUE))
+
+# Print the median CDRSB values by visit number
+print(median_cdrsb_by_visit_number)
+
+# Create the plot for median CDRSB by visit number
+ggplot(median_cdrsb_by_visit_number, aes(x = VisitNumber, y = median_cdrsb)) +
+  geom_line(group = 1) + # group = 1 ensures it is treated as a continuous line
+  geom_point() +
+  labs(title = "Median CDRSB by Visit Number",
+       x = "Visit Number",
+       y = "Median CDRSB") +
+  theme_bw()
+```
+
+From the median value of each visit, we can see that there is no significant information that we can extract here. The median CDR-SB values remain relatively low and stable across most visits, except for a sharp increase at visit number 25. Additionally, the sharp increase at visit number 25 might be an outlier resulting from a small sample size at that particular visit, further emphasizing the challenge of drawing conclusions from this data.
+
+```{r}
+median_cdrsb_by_viscode <- filtered_data %>%
+  group_by(VISCODE) %>%
+  summarise(median_cdrsb = median(CDRSB, na.rm = TRUE))
+
+# Print the median CDRSB values by VISCODE
+print(median_cdrsb_by_viscode)
+
+# Create the plot for median CDRSB by VISCODE
+ggplot(median_cdrsb_by_viscode, aes(x = VISCODE, y = median_cdrsb)) +
+  geom_line(group = 1) + # group = 1 ensures it is treated as a continuous line
+  geom_point() +
+  labs(title = "Median CDRSB by VISCODE",
+       x = "VISCODE",
+       y = "Median CDRSB") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+If we use the median of the CDR-SB values and compare it to the months when patients come to visit, we see that the median CDR-SB values fluctuate between 0.5 and 2.0 over different visits. The median values are generally around 1 or slightly above 1, indicating that on average, patients exhibit very mild dementia symptoms during their visits. However, it is important to note that these fluctuations might not be highly informative due to the small sample sizes at certain visits. In some months, only 1 or 2 patients might come for a visit, making the median values less reliable and more susceptible to variability. Therefore, we must be cautious in interpreting these median values as they might not accurately represent the broader patient population or the true progression of cognitive impairment.
+
+```{r}
+filtered_data <- unique_data %>%
+  select(DX, CDRSB) %>%
+  filter(!is.na(DX) & !is.na(CDRSB) & DX != "")
+
+# Plotting boxplot or violin plot
+ggplot(filtered_data, aes(x = DX, y = CDRSB, fill = DX)) +
+  geom_boxplot() +  # Use geom_violin() for violin plot
+  labs(title = "Relationship Between CDRSB and Diagnosis",
+       x = "Diagnosis",
+       y = "CDRSB") +
+  theme_bw()
+```
+
+As we can see here, there is a relationship between the diagnosis and the score of the CDR-SB. The Cognitive Normal (CN) group has scores mostly below 1, indicating no to very mild cognitive impairment. The Mild Cognitive Impairment (MCI) group has a median score around 2/3, with some outliers above 5. According to the CDR-SB, a value between 0.5 and 5 typically indicates very mild to mild dementia. Lastly, the group diagnosed with Alzheimer’s Disease (AD) has scores that are significantly higher, with some individuals scoring even above 15, which indicates severe dementia. The median score for the AD group is around 5, reflecting moderate dementia severity. This distribution highlights how CDR-SB scores increase with the severity of cognitive impairment and dementia.
+
+```{r}
+age_range_data <- unique_data %>%
+  filter(!is.na(unique_data$AGE)) %>%
+  mutate(AgeRange = cut(AGE, breaks = age_bins, labels = age_labels, right = FALSE))
+
+summary_stats <- age_range_data %>%
+  filter(AgeRange != "NA") %>% 
+  group_by(AgeRange) %>%
+  summarise(
+    Mean_CDRSB = mean(CDRSB, na.rm = TRUE),
+    Median_CDRSB = median(CDRSB, na.rm = TRUE),
+    SD_CDRSB = sd(CDRSB, na.rm = TRUE)
+  )
+
+ggplot(age_range_data, aes(x = AgeRange, y = CDRSB, fill = AgeRange)) +
+  geom_boxplot() +
+  labs(title = "CDRSB Values Across Age Ranges",
+       x = "Age Range",
+       y = "CDRSB") +
+  theme_bw()
+```
+
+As we can see from the plot above, each age group has CDRSB values predominantly below 5, with several outliers exceeding this value. Notably, in the 60-69 age group, there is a significant increase in the number of outliers with CDRSB values above 5 compared to the 50-59 age group. This trend of increasing CDRSB values with age is evident when observing the behavior of the boxplots for each group. The median and interquartile range shift upwards as the age groups progress, indicating a general increase in the severity of dementia symptoms with age.
+
+```{r}
+# Percentage brain volume
+# Calculate percentage change in WholeBrain volume for each visit compared to the previous visit
+percentage_data <- data %>%
+  group_by(PTID) %>%
+  mutate(
+    PreviousWholeBrain = lag(WholeBrain), # Get the WholeBrain volume of the previous visit
+    PercentageChange = ((WholeBrain - PreviousWholeBrain) / PreviousWholeBrain) * 100
+  ) %>%
+  ungroup()
+
+percentage_data$PercentageChange[is.na(percentage_data$PercentageChange)] <- 0
+
+summary_counts <- percentage_data %>%
+  filter(!is.na(PercentageChange) & PercentageChange != 0) %>%
+  mutate(ChangeType = ifelse(PercentageChange < 0, "Negative", "Positive")) %>%
+  group_by(ChangeType) %>%
+  summarise(Count = n())
+
+print(summary_counts)
+```
+
+The analysis of brain size changes shows that the number of individuals with increased brain size (2356) is relatively close to those with decreased brain size (3065). This suggests that a substantial number of individuals in the dataset maintain a good brain size, despite the higher count of negative changes. The difference is not large enough to overshadow the presence of a significant number of people with stable or improving brain volumes, especially when considering the age of the participants.
+
+```{r}
+apoe4_cdrsb_data <- data %>%
+  select(PTID, APOE4, CDRSB) %>%
+  filter(!is.na(APOE4) & !is.na(CDRSB) & APOE4 != 'NA')
+
+# Summary statistics for CDRSB by APOE4 alleles
+summary_stats <- apoe4_cdrsb_data %>%
+  group_by(APOE4) %>%
+  summarise(
+    Mean_CDRSB = mean(CDRSB, na.rm = TRUE),
+    Median_CDRSB = median(CDRSB, na.rm = TRUE),
+    SD_CDRSB = sd(CDRSB, na.rm = TRUE),
+    Count = n()
+  )
+# Violin plot for a detailed distribution view
+ggplot(apoe4_cdrsb_data, aes(x = as.factor(APOE4), y = CDRSB, fill = as.factor(APOE4))) +
+  geom_violin(trim = FALSE) +
+  labs(title = "Distribution of CDRSB by APOE4 Alleles",
+       x = "Number of APOE4 Alleles",
+       y = "CDRSB",
+       fill = "APOE4 Alleles") +
+  theme_bw()
+
+```
+
+The violin plot shows the relationship between the number of APOE4 alleles and the patients' CDRSB scores. We observe that among patients with 0 APOE4 alleles, the majority have CDRSB scores near 0, indicating lower levels of cognitive impairment. As the number of APOE4 alleles increases to 1 and 2, the distribution of CDRSB scores shifts higher, reflecting more severe cognitive impairment. This indicates a clear trend where the presence of more APOE4 alleles is associated with higher CDRSB scores, suggesting a greater level of cognitive decline.
+
+## Part 2: Follow-up analysis 
+
+Now we are trying to dig more deeper to each brain part and compare it to the Intracranial Volume (ICV), as ICV in human are generally stable but brain size can shrink overtime.
+
+```{r}
+data <- data %>%
+  filter(!is.na(WholeBrain)) %>%
+  mutate(
+    Ventricles_percent = (Ventricles / ICV) * 100,
+    Hippocampus_percent = (Hippocampus / ICV) * 100,
+    WholeBrain_percent = (WholeBrain / ICV) * 100,
+    Entorhinal_percent = (Entorhinal / ICV) * 100,
+    Fusiform_percent = (Fusiform / ICV) * 100,
+    MidTemp_percent = (MidTemp / ICV) * 100
+  )
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+# Plot for WholeBrain volume
+ggplot(filtered_data, aes(x = Month, y = WholeBrain_percent, group = PTID)) +
+  geom_line(color = "black", alpha = 0.5) +
+  geom_point(color = "black", alpha = 0.7) + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Whole Brain Volume Across Visits",
+       x = "Month of Visit",
+       y = "Whole Brain Volume (Percentage)") +
+  theme_bw() 
+```
+
+From the whole brain volume plot, we observe that the general trend appears stable, with a slight downward trajectory over time. This aligns with expectations, as it is well-documented that brain volume tends to decrease gradually as humans age. However, an interesting anomaly is present in the plot: there are two data points where the whole brain volume exceeds 100% of the intracranial volume (ICV). These points are biologically impossible, as the brain cannot occupy more than the entire intracranial space. 
+
+```{r}
+over_100 <- filtered_data %>%
+  filter(filtered_data$WholeBrain_percent > 100)
+
+over_100
+```
+
+We can see from the result the ICV is actually smaller from the whole brain, this might be because wrong input. We can just ignore this and maybe focur on the one that below 50% and how is this relation to the diagnosis.
+
+```{r}
+below_50 <- filtered_data %>%
+  filter(filtered_data$WholeBrain_percent < 50)
+
+diagnosis_summary <- below_50 %>%
+  group_by(DX) %>%
+  summarize(count = n(), .groups = 'drop')
+diagnosis_summary
+```
+
+From the filtered data of individuals with whole brain volume below 50% of their intracranial volume (ICV), we observe that out of 17 individuals, 6 have been diagnosed with Alzheimer's Disease (AD), 6 with Mild Cognitive Impairment (MCI), and only 5 are classified as cognitively normal (CN). This indicates that a significant portion of individuals with such low brain volume is experiencing some level of cognitive impairment, whether it's AD or MCI. 
+
+```{r}
+# Plot for Hippocampus
+ggplot(filtered_data, aes(x = Month, y = Hippocampus_percent, group = PTID)) +
+  geom_line() +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Hippocampus Volume Across Visits",
+       x = "Month of Visit",
+       y = "Hippocampus Volume (Percentage)") +
+  theme_bw()
+```
+
+Continuing to another brain region, we now examine the Hippocampus. The plot shows that the hippocampal volume is generally quite small relative to the intracranial volume, typically occupying less than 1% of the total ICV. Similar to the whole brain volume, the hippocampal volume remains relatively steady across multiple visits, with only minor fluctuations over time. The trend line further confirms this stability, indicating that on average, there is little change in hippocampal volume across the different time points in this dataset.
+
+```{r}
+# Plot for Ventricles
+ggplot(filtered_data, aes(x = Month, y = Ventricles_percent, group = PTID)) +
+  geom_line() +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Ventricles Volume Across Visits",
+       x = "Month of Visit",
+       y = "Ventricles Volume (Percentage)") +
+  theme_bw() 
+```
+
+Next, we examine the ventricles, which show an unexpected result. Unlike the other brain regions we've analyzed, the trend in the ventricles' volume appears to be increasing over time, as indicated by the upward slope of the trend line. This increase in ventricular volume is contrary to the general expectation that brain structures tend to decrease in size with aging. As the brain shrinks, the ventricles often enlarge to fill the space, a phenomenon commonly observed in neurodegenerative diseases like Alzheimer's. This trend might, therefore, indicate a pathological process rather than a typical age-related change (https://dnd.or.kr/DOIx.php?id=10.12779/dnd.2024.23.2.95).
+
+```{r}
+# Plot for Entorhinal
+ggplot(filtered_data, aes(x = Month, y = Entorhinal_percent, group = PTID)) +
+  geom_line() +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Entorhinal Volume Across Visits",
+       x = "Month of Visit",
+       y = "Entorhinal Volume (Percentage)") +
+  theme_bw()
+```
+
+Similar to the analysis of the ventricles, we observe an increase in the entorhinal volume over time. The plot shows that while the entorhinal cortex generally has a small volume relative to the total intracranial volume, the trend line indicates a slight upward trajectory across the visits.
+
+```{r}
+# Plot for Fusiform
+ggplot(filtered_data, aes(x = Month, y = Fusiform_percent, group = PTID)) +
+  geom_line() +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Fusiform Volume Across Visits",
+       x = "Month of Visit",
+       y = "Fusiform Volume (Percentage)") +
+  theme_bw()
+```
+
+The fusiform shows a stable volume, with slight increase in the trend, across the visits in this dataset, which could suggest that it is less affected by the factors causing atrophy in other brain regions.
+
+```{r}
+# Plot for Midterm
+ggplot(filtered_data, aes(x = Month, y = MidTemp_percent, group = PTID)) +
+  geom_line() +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, aes(group = 1, color = "Trend Line")) +
+  scale_color_manual(values = rainbow(length(unique(filtered_data$PTID)))) + 
+  labs(title = "Midterm Volume Across Visits",
+       x = "Month of Visit",
+       y = "Midterm Volume (Percentage)") +
+  theme_bw()
+```
+
+Same with fusiform part, we can see slight increase but in general still a stable plot. An interesting observation is that while the whole brain volume decreases, other parts of the brain remain stable or even show a slight increase in size. When I tried to look at this phenomenon in the internet, it is closely related to brain atrophy. As the brain tissue shrinks, the resulting space is often filled with cerebrospinal fluid, leading to the expansion of certain regions, such as the ventricles.
+
+```{r}
+model <- lm(WholeBrain ~ AGE + PTGENDER + PTEDUCAT + APOE4, data = data)
+
+stargazer(model, type = "text",
+          title = "Regression Results",
+          covariate.labels = c("Age", "Gender", "Education", "APOE4"),
+          dep.var.labels = "Brain Size")
+```
+
+The linear regression results indicate that age, gender, education, and the presence of the APOE4 gene are significant predictors of brain size, each having a substantial impact. As expected, brain size decreases with agee. Similarly, carrying the APOE4 gene, a known risk factor for Alzheimer's disease, is associated with a reduction in brain size, reflecting the gene’s contribution to neurodegenerative changes.
+
+On the other hand, education has a positive influence: the more years of education a person has, the larger their brain size tends to be, possibly due to the concept of cognitive reserve, where lifelong learning helps maintain brain structure. Regarding gender, the model shows that males (coded as 1) tend to have larger brain sizes compared to females (coded as 0), which aligns with biological differences in brain volume between the sexes, though this does not necessarily reflect differences in cognitive ability.
+
+Additionally, the large constant in the model reflects the baseline brain size when all variables are at their reference levels (age = 0, female, no APOE4, and no education), which makes sense given the generally large scale of brain volume measurements.

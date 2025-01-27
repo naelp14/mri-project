@@ -1,0 +1,382 @@
+---
+title: "ADNI-Analysis7"
+output: html_document
+date: "2024-11-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("dtwclust")
+library("xgboost")
+library("caTools")
+library("caret")
+library("pROC")
+```
+
+## R Markdown
+
+```{r}
+normalize_minmax <- function(x) {
+  return ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+}
+
+sort_viscode <- function(viscode, months, cdrsb) {
+  visit_numeric <- as.numeric(gsub("m", "", gsub("bl", "0", viscode)))
+  sorted_indices <- order(visit_numeric)
+  list(
+    viscode_sorted = viscode[sorted_indices],
+    cdrsb_sorted = cdrsb[sorted_indices],
+    month_sorted = months[sorted_indices]
+  )
+}
+```
+
+```{r}
+train_xgb_model <- function(data) {
+  # Split data
+  data$cluster <- factor(data$cluster, levels = c("Stable", "Mild Progression", "Moderate Progression", "Severe Progression"))
+  set.seed(123)
+  sample_split <- sample.split(Y = data$cluster, SplitRatio = 0.7)
+  train_set <- subset(data, sample_split == TRUE)
+  test_set <- subset(data, sample_split == FALSE)
+  
+  # Prepare training and testing labels and features
+  y_train <- as.integer(train_set$cluster) - 1
+  y_test <- as.integer(test_set$cluster) - 1
+  X_train <- train_set %>% dplyr::select(-cluster)
+  X_test <- test_set %>% dplyr::select(-cluster)
+  
+  print(levels(train_set$cluster))
+  
+  # Convert to xgb.DMatrix
+  xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+  xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+  
+  # Set XGBoost parameters
+  xgb_params <- list(
+    booster = "gbtree",
+    eta = 0.01,
+    max_depth = 8,
+    gamma = 4,
+    subsample = 0.75,
+    colsample_bytree = 1,
+    objective = "multi:softprob",
+    eval_metric = "mlogloss",
+    num_class = length(levels(data$cluster))
+  )
+  
+  # Train the model
+  xgb_model <- xgb.train(
+    params = xgb_params,
+    data = xgb_train,
+    nrounds = 5000,
+    verbose = 1
+  )
+  
+  pred_probs <- predict(xgb_model, newdata = xgb_test)
+  num_classes <- xgb_params$num_class
+  pred_probs <- matrix(pred_probs, ncol = num_classes, byrow = TRUE)
+  auc_values <- sapply(0:(num_classes - 1), function(class) {
+    # Binary labels: 1 for current class, 0 for others
+    binary_labels <- ifelse(y_test == class, 1, 0)
+    roc_obj <- roc(binary_labels, pred_probs[, class + 1])
+    auc(roc_obj)
+  })
+  
+  # Print and return the AUC values for each class
+  names(auc_values) <- paste("AUC_Class", 0:(num_classes - 1), sep = "_")
+  
+  # Return the model and accuracy
+  return(list(model = xgb_model, auc = auc_values))
+}
+```
+
+```{r}
+# Get fluctuating data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+data <- data %>%
+  filter(!is.na(WholeBrain))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- data %>%
+  filter(data$PTID %in% ptid_more_than_once)
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+
+summary_table <- grouped_data %>%
+  mutate(
+    cdrsb_mean = map_dbl(cdrsb_scores, mean, na.rm = TRUE),         
+    cdrsb_first = map_dbl(cdrsb_scores, ~ .x[1]),                   
+    cdrsb_last = map_dbl(cdrsb_scores, ~ .x[length(.x)]),           
+    cdrsb_sd = map_dbl(cdrsb_scores, sd, na.rm = TRUE),
+    cdrsb_scores = cdrsb_scores,
+    months = months,
+    visits = map_int(cdrsb_scores, length)
+  ) %>%
+  select(PTID, cdrsb_mean, cdrsb_first, cdrsb_last, cdrsb_sd, cdrsb_scores, months, visits)
+
+threshold_diff <- 1
+threshold_sd <- 1
+fluctuating_data <- summary_table %>%
+  filter(abs(cdrsb_first - cdrsb_last) < threshold_diff & cdrsb_sd > threshold_sd)
+
+plot_data <- fluctuating_data %>%
+  unnest(c(cdrsb_scores, months))  # Unnest the list columns
+
+ggplot(plot_data, aes(x = months, y = cdrsb_scores, group = PTID, color = PTID)) +
+  geom_line() +
+  labs(title = "CDRSB Progression Over Time by Patient",
+       x = "Months", y = "CDRSB Score") +
+  theme_minimal() +
+  theme(legend.position = "none")  # Hide legend for individual patients
+```
+
+```{r}
+# Load data
+data <- read.csv("/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple.csv")
+
+norm_data <- data %>% mutate(across(where(is.numeric), normalize_minmax))
+
+ptid_counts <- table(data$PTID)
+
+ptid_more_than_once <- names(ptid_counts[ptid_counts > 1])
+filtered_data <- norm_data %>%
+  filter(norm_data$PTID %in% ptid_more_than_once)
+
+grouped_data <- filtered_data %>%
+  drop_na(CDRSB) %>%                
+  group_by(PTID) %>%
+  summarize(
+    code = list(VISCODE),
+    months = list(Month),
+    cdrsb_scores = list(CDRSB)
+  ) %>%
+  mutate(
+    sorted = pmap(list(code, months, cdrsb_scores), sort_viscode), 
+    code = map(sorted, "viscode_sorted"),             
+    cdrsb_scores = map(sorted, "cdrsb_sorted"),
+    months = map(sorted, "month_sorted")
+  ) %>%
+  dplyr::select(-sorted) %>%  
+  filter(
+    !sapply(cdrsb_scores, function(x) all(x == 0))
+  )
+```
+
+```{r}
+# DTW
+time_series_data <- grouped_data$cdrsb_scores
+
+dtw_kmeans_result <- tsclust(time_series_data, 
+                             type = "partitional",  # Partitional clustering (k-means)
+                             k = 4,                 # Number of clusters (adjust k as needed)
+                             distance = "dtw",      # Use DTW as distance metric
+                             centroid = "pam",      # PAM-based centroid (good for non-Euclidean)
+                             seed = 123)            # Seed for reproducibility
+
+cluster_assignments <- dtw_kmeans_result@cluster
+dtw_data <- grouped_data
+dtw_data$cluster <- as.factor(cluster_assignments)
+dtw_data <- dtw_data %>%
+  unnest(cols = c(months, cdrsb_scores))
+
+dtw_data <- dtw_data %>%
+  mutate(cluster = factor(cluster, 
+                          levels = c(1, 2, 3, 4), 
+                          labels = c("Mild Progression", 
+                                     "Stable", 
+                                     "Severe Progression", 
+                                     "Moderate Progression")))
+
+```
+
+We can see below the DTW of the normalized data that we did before.
+
+```{r}
+# make sure to take only PTID and cluster
+filtered_dtw <- dtw_data %>%
+  dplyr::select(PTID, cluster) %>%
+  group_by(PTID) %>%
+  dplyr::slice(1)
+
+merged_data <- left_join(filtered_dtw, data, by = "PTID")
+write.csv(merged_data, "/Users/nathaniel.putera/Projects/UCPH/MRI-Project/ADNIMERGE-Simple-dtw.csv", row.names = FALSE)
+```
+
+```{r}
+ggplot(dtw_data, aes(x = months, y = cdrsb_scores, group = PTID, color = factor(cluster))) +
+  geom_line(alpha = 0.6) +
+  labs(title = "CDRSB Progression by Cluster",
+       x = "Months of Visit",
+       y = "CDRSB Score",
+       color = "Cluster") +
+  theme_bw()
+```
+
+```{r}
+fluctuating_clusters <- fluctuating_data %>%
+  inner_join(dtw_data %>% select(PTID, cluster), by = "PTID")
+
+fluctuating_clusters %>% select(PTID, cdrsb_first, cdrsb_last, cdrsb_mean, cdrsb_sd, cluster) %>% distinct()
+```
+
+With this DTW cluster result, we will try to use it as a label for the classification later. So after merging the cluster result with the original data, we will only take the first occurence only then do XGBoost on the data to find which variables is actually significance to the result. We will make couple of sets, and will compare the result using AUC to see which one is better.
+
+```{r}
+# This to filter to show only 1 data
+first_occurrence <- merged_data %>%
+  group_by(PTID) %>% 
+  dplyr::slice(1) %>%
+  ungroup()
+```
+
+Below are the first xgboost we do using cognitive test set.
+
+```{r}
+# Set using Cognitive test
+cg_set <- first_occurrence %>%
+  dplyr::select(c(FAQ, RAVLT_learning, RAVLT_forgetting, RAVLT_immediate, MMSE, ADAS11, ADAS13, ADASQ4, LDELTOTAL, DIGITSCOR, TRABSCOR, MOCA, cluster))
+
+cg_xgb <- train_xgb_model(cg_set)
+cg_importance_matrix <- xgb.importance(model = cg_xgb$model)
+print(cg_importance_matrix)
+xgb.plot.importance(cg_importance_matrix)
+```
+
+Below are the next xgboost we do using CSF (Cerebrospinal fluid) set.
+
+```{r}
+# Set using CSF (Cerebrospinal fluid)
+csf_set <- first_occurrence %>%
+  mutate(
+    ABETA = as.numeric(gsub(">1700", "2500", ABETA)),
+    TAU = as.numeric(gsub(">1700", "1700", TAU)),
+    PTAU = as.numeric(gsub(">1700", "1700", PTAU))
+  ) %>%
+  select(c(ABETA, TAU, PTAU, cluster))
+
+csf_xgb <- train_xgb_model(csf_set)
+csf_importance_matrix <- xgb.importance(model = csf_xgb$model)
+print(csf_importance_matrix)
+xgb.plot.importance(csf_importance_matrix)
+```
+
+Below are the next xgboost we do using PET (Positron Emission Tomography) set.
+
+```{r}
+# Set using PET (Positron Emission Tomography)
+pet_set <- first_occurrence %>%
+  select(c(FDG, PIB, AV45, FBB, cluster))
+
+pet_xgb <- train_xgb_model(pet_set)
+pet_importance_matrix <- xgb.importance(model = pet_xgb$model)
+print(pet_importance_matrix)
+xgb.plot.importance(pet_importance_matrix)
+```
+
+Below are the next xgboost we do using risk factor set.
+
+```{r}
+# Set using risk factor
+risk_set <- first_occurrence %>%
+  select(c(AGE, PTGENDER, APOE4, PTEDUCAT, cluster)) %>%
+  mutate(PTGENDER = ifelse(PTGENDER == "Male", 1, 0))
+
+risk_xgb <- train_xgb_model(risk_set)
+risk_importance_matrix <- xgb.importance(model = risk_xgb$model)
+print(risk_importance_matrix)
+xgb.plot.importance(risk_importance_matrix)
+```
+
+Below are the next xgboost we do using MRI Biomarker set.
+
+```{r}
+# Set using MRI
+mri_set <- first_occurrence %>%
+  mutate(
+    Ventricles = (Ventricles / ICV),
+    Hippocampus = (Hippocampus / ICV),
+    WholeBrain = (WholeBrain / ICV),
+    Entorhinal = (Entorhinal / ICV),
+    Fusiform = (Fusiform / ICV),
+    MidTemp = (MidTemp / ICV))%>%
+  select(c(Ventricles, Hippocampus, WholeBrain, Entorhinal, Fusiform, MidTemp, cluster))
+
+mri_xgb <- train_xgb_model(mri_set)
+mri_importance_matrix <- xgb.importance(model = mri_xgb$model)
+print(mri_importance_matrix)
+xgb.plot.importance(mri_importance_matrix)
+```
+
+Next we want to compare how each section perform by comparing the AUC.
+
+```{r}
+# This is not valid anymore as we change it to use auc values instead accuracy, figure this out later
+auc_data <- data.frame(
+  Model = rep(c("cg_xgb", "csf_xgb", "mri_xgb", "risk_xgb", "pet_xgb"), each = 4),
+  Class = rep(c("Class_0", "Class_1", "Class_2", "Class_3"), times = 5),
+  AUC = c(cg_xgb$auc, csf_xgb$auc, mri_xgb$auc, risk_xgb$auc, pet_xgb$auc)
+)
+
+class_mapping <- c("Class_0" = "Stable", "Class_1" = "Mild Progression", "Class_2" = "Moderate Progression", "Class_3" = "Severe Progression")
+auc_data$Class <- class_mapping[auc_data$Class]
+
+print(auc_data$AUC)
+
+ggplot(auc_data, aes(x = Model, y = AUC, fill = Class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "AUC Comparison Across Models and Classes", x = "Model", y = "AUC") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+Lastly doing comparison using MRI and Risk as it is the easiest data to collect
+
+```{r}
+mri_risk_set <- first_occurrence %>%
+  mutate(
+    Ventricles = (Ventricles / ICV),
+    Hippocampus = (Hippocampus / ICV),
+    WholeBrain = (WholeBrain / ICV),
+    Entorhinal = (Entorhinal / ICV),
+    Fusiform = (Fusiform / ICV),
+    MidTemp = (MidTemp / ICV))%>%
+  select(c(Ventricles, Hippocampus, WholeBrain, Entorhinal, Fusiform, MidTemp, AGE, PTGENDER, APOE4, PTEDUCAT, cluster)) %>%
+  mutate(PTGENDER = ifelse(PTGENDER == "Male", 1, 0))
+
+mri_risk_xgb <- train_xgb_model(mri_risk_set)
+mri_risk_importance_matrix <- xgb.importance(model = mri_risk_xgb$model)
+print(mri_risk_importance_matrix)
+xgb.plot.importance(mri_risk_importance_matrix)
+```
+
+
+Then we can see the AUC values of this set as below
+
+```{r}
+mri_risk_xgb$auc
+```
